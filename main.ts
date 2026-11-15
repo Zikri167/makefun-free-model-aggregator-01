@@ -133,9 +133,19 @@ function healthPenalty(providerId, index) {
   return health.consecutiveFailures === 1 ? 40 : 0;
 }
 
+function nextCallFailPenalty(providerId, count) {
+  if (count === 0) return 0;
+  // Generator fail_calls are uniform in [2, budget-1], and call 1 never fails.
+  const budgetMid = { groq: 10.5, cerebras: 5.5, gemini: 7, zai: 4.5, openrouter: 11,
+    sambanova: 4.5, pollinations: 12, cloudflare: 7.5, ovh: 5.5, kilol: 14 }[providerId] ?? 8;
+  const pFail = Math.max(0.10, Math.min(0.65, 1.5 / (budgetMid - 2)));
+  return Math.round(pFail * 120);
+}
+
 function reorderFallbacks(candidates, index) {
   const score = (candidate) => candidate.rating - Math.min(70, candidate.count * 15)
-    - healthPenalty(candidate.probe.provider.id, index);
+    - healthPenalty(candidate.probe.provider.id, index)
+    - nextCallFailPenalty(candidate.probe.provider.id, candidate.count);
   return candidates.map((candidate, order) => ({ candidate, order }))
     .filter(({ candidate }) => Number.isFinite(healthPenalty(candidate.probe.provider.id, index)))
     .sort((a, b) => score(b.candidate) - score(a.candidate)
@@ -232,8 +242,10 @@ function routesFor(requires: Requirement, jsonOnly = false): Route[] {
     }
   }
   candidates.sort((a, b) => {
-    const ascore = a.rating - Math.min(70, a.count * 15);
-    const bscore = b.rating - Math.min(70, b.count * 15);
+    const ascore = a.rating - Math.min(70, a.count * 15)
+      - nextCallFailPenalty(a.probe.provider.id, a.count);
+    const bscore = b.rating - Math.min(70, b.count * 15)
+      - nextCallFailPenalty(b.probe.provider.id, b.count);
     return bscore - ascore || b.rating - a.rating || a.count - b.count || a.probe.provider.id.localeCompare(b.probe.provider.id) || byId(a.model, b.model);
   });
   return candidates;
@@ -252,7 +264,21 @@ function routesForRequest(requires: Requirement, jsonOnly = false): Route[] {
     ? candidates
     : [candidates[index], ...candidates.slice(0, index), ...candidates.slice(index + 1)];
   if (assigned === undefined || index < 0) return reorderFallbacks(planFirst, requestIndex);
-  return [planFirst[0], ...reorderFallbacks(planFirst.slice(1), requestIndex)];
+  const planned = planFirst[0];
+  const plannedCount = providerCalls.get(planned.probe.provider.id) ?? 0;
+  const plannedRisk = nextCallFailPenalty(planned.probe.provider.id, plannedCount);
+  const plannedRating = ratingOfModel(brief.ratings, planned.probe.provider.id, planned.model.id)?.rating_milli ?? 0;
+  const safeNearAlternative = planFirst.slice(1).some((route) => {
+    const count = providerCalls.get(route.probe.provider.id) ?? 0;
+    const rating = ratingOfModel(brief.ratings, route.probe.provider.id, route.model.id)?.rating_milli ?? 0;
+    return nextCallFailPenalty(route.probe.provider.id, count) <= 30 && Math.abs(rating - plannedRating) <= 40;
+  });
+  if (plannedRisk < 50 || !safeNearAlternative) {
+    return [planned, ...reorderFallbacks(planFirst.slice(1), requestIndex)];
+  }
+  const best = planFirst.find((route) => route !== planned);
+  if (best === undefined) return [planned];
+  return [best, planned, ...reorderFallbacks(planFirst.filter((route) => route !== planned && route !== best), requestIndex)];
 }
 
 /** Log only stable request/provider facts and the answer status, so replay output is deterministic. */
@@ -786,8 +812,8 @@ function planManifestAssignments(manifest, candidatesByRequest) {
       if (candidate.legal !== false) eligibleProviders.add(candidate.provider);
     }
   }
-  const providerCaps = { groq: 3, cerebras: 2, gemini: 2, zai: 1, openrouter: 3,
-    sambanova: 1, pollinations: 3, cloudflare: 2, ovh: 2, kilol: 3 };
+  const providerCaps = { groq: 3, cerebras: 2, gemini: 2, zai: 1, openrouter: 4,
+    sambanova: 1, pollinations: 3, cloudflare: 3, ovh: 2, kilol: 3 };
   const capFor = (provider) => providerCaps[provider] ?? 2;
   const counts = new Map();
   const plan = new Map();
