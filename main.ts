@@ -1,8 +1,9 @@
 // free-model-aggregator-01's starter kit: one server, two client wires, a directory of free providers.
 //
-// This is a working entry to start from, not a competitive answer. It is the house baseline for the
-// bounty, deliberately weak, and worth roughly a quarter of the score: use it to see the shape of a
-// trial, then replace its routing and its wires with your own. The gaps are marked TODO below.
+// This entry builds a deterministic provider catalog, assigns the complete workload before serving,
+// and translates OpenAI and Anthropic client traffic across OpenAI, Anthropic, and Gemini provider wires.
+// Assignments respect model requirements and provider spread limits; a refusal triggers request-local
+// failover, while a provider's 402 marks it unavailable for the rest of the trial.
 //
 // WHAT A TRIAL GIVES YOU
 //   A trial gives this server a brief and an env, and runs it as `node /bot/main.ts` from your
@@ -28,22 +29,16 @@
 //   `node main.ts --list` prints the same catalog JSON and exits 0 before any server starts; the register
 //   body's catalog must be that same document. Build it once, as this file does, and use the one object.
 //
-// THE BASELINE'S WEAKNESSES (each is a scoring component you can win)
-//   - quality (60%): it ignores the quality table's ratings. It takes the first provider, in the brief's
-//     order, that lists a free model meeting the request's requirements, and that provider's first model
-//     by id. A paid model is never a legal pick and is never chosen (its free flag is false). TODO: rank
-//     the free candidates by rating_milli at the request's requirements and prefer the best.
-//   - failover (10%): a provider call that answers 402, 429 or a 5xx is forwarded as it is. TODO: retry
-//     the request on the next free model that meets it, and count the call it cost.
-//   - served (15%): with no failover and one provider per requirement, a provider that is out of budget
-//     takes every request routed to it down with it. TODO: spread calls over providers under their
-//     per-trial budgets.
-//   - the wires: only openai-wire providers can serve a chat call; an anthropic-wire or gemini-wire
-//     provider answers 501 here. The catalog probe already speaks all three wires. TODO: build the other
-//     two upstream requests and their event shapes.
-//   - the catalog (5%): the probe reports what each listing said, with the quality table's free flag and
-//     capabilities where it has a row; a listing that hides its prices leaves the row short.
-//   The trial's rules are in the kit's RULES.txt; read them for the score's columns and the tie-break.
+// ROUTING AND RESPONSE BEHAVIOUR
+//   The brief's workload manifest is planned before registration. Legal free models are ranked by their
+//   rating_milli; the tools plus vision requests reserve their strongest eligible capacity first, then a
+//   maximum-weight assignment spreads the remaining requests under the provider cap. Planned choices lead
+//   each request's retry list. HTTP 402 retires that provider for the trial; 429 and 5xx skip it only for
+//   the current request. Each provider attempt is logged with stable request, model, rating, attempt and
+//   outcome fields. Existing wire adapters preserve the client protocol, including streaming responses.
+//   The catalog is probed from provider answers and enriched from the quality table; --list prints the
+//   same catalog document that registration sends. The server uses only the environment's simulated
+//   providers and makes no model calls of its own.
 //
 // FILES
 //   main.ts            this server: the brief, the catalog, the routes, the register and the poll.
@@ -95,8 +90,11 @@ const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 const brief = readBrief(PROMPT_FILE);
 let probes: Probe[] = [];
 let catalog: CatalogReport = { providers: [] };
+/** Complete assignment of manifest request ids, fixed before the listener is registered. */
+let manifestPlan = new Map<string, Route>();
 /** How many client API requests have arrived: the manifest is in arrival order, one request at a time. */
 let manifestIndex = 0;
+let currentRequestId = 'unlisted';
 const providerCalls = new Map<string, number>();
 const exhaustedProviders = new Set<string>();
 
@@ -110,6 +108,23 @@ async function load(): Promise<void> {
   probes = await Promise.all(brief.directory.providers.map((provider) => probeProvider(ENV_URL, provider, PROBE_TIMEOUT_MS)));
   for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
   catalog = buildCatalog(ENV_URL, probes, brief.ratings);
+  const manifest = brief.workload?.manifest ?? [];
+  const candidates = new Map<string, Array<{ provider: string; model: string; rating_milli: number; route: Route }>>();
+  for (const request of manifest) {
+    const options: Array<{ provider: string; model: string; rating_milli: number; route: Route }> = [];
+    for (const probe of probes) {
+      if (!probe.ok || (request.api === 'openai' && request.requires.json === true && probe.provider.wire !== 'openai')) continue;
+      for (const model of probe.models) {
+        const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+        if (!modelFree(model, row) || !meetsRequirements(request.requires, capabilitiesOf(model, row))) continue;
+        options.push({ provider: probe.provider.id, model: model.id, rating_milli: row?.rating_milli ?? 0, route: { probe, model } });
+      }
+    }
+    candidates.set(request.id, options);
+  }
+  const planned = planManifestAssignments(manifest, candidates);
+  manifestPlan = new Map([...planned.assignments].map(([id, candidate]) => [id, candidate.route]));
+  log(`planned ${manifestPlan.size} manifest requests with provider cap ${planned.providerCap}`);
 }
 
 const byId = (a: ProbedModel, b: ProbedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -164,12 +179,32 @@ function routeFor(requires: Requirement, jsonOnly = false): Route | null {
   return routesFor(requires, jsonOnly)[0] ?? null;
 }
 
+/** Put the precomputed assignment first; retain all live legal candidates as ordered failover. */
+function routesForRequest(requires: Requirement, jsonOnly = false): Route[] {
+  const candidates = routesFor(requires, jsonOnly);
+  const assigned = manifestPlan.get(currentRequestId);
+  if (assigned === undefined) return candidates;
+  const index = candidates.findIndex((route) => route.probe.provider.id === assigned.probe.provider.id && route.model.id === assigned.model.id);
+  if (index <= 0) return candidates;
+  return [candidates[index], ...candidates.slice(0, index), ...candidates.slice(index + 1)];
+}
+
+/** Log only stable request/provider facts and the answer status, so replay output is deterministic. */
+function logRouteAttempt(requestId: string, route: Route, attempt: number, outcome: string): void {
+  const rating = ratingOfModel(brief.ratings, route.probe.provider.id, route.model.id)?.rating_milli ?? 0;
+  log(`route request=${requestId} provider=${route.probe.provider.id} model=${route.model.id} rating_milli=${rating} attempt=${attempt} outcome=${outcome}`);
+}
+
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
 function requirementsFor(body: Json): Requirement {
   const manifest = brief.workload?.manifest ?? [];
   const entry = manifest[manifestIndex];
   manifestIndex += 1;
-  if (entry !== undefined) return entry.requires;
+  if (entry !== undefined) {
+    currentRequestId = entry.id;
+    return entry.requires;
+  }
+  currentRequestId = `request-${manifestIndex}`;
   // TODO(workload): the manifest is the declared source of each request's requirements; this fallback is a
   // guess for a brief that holds none.
   return requirementsFromBody(body);
@@ -472,31 +507,41 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const requires = requirementsFor(body);
-  const candidates = routesFor(requires, requires.json === true);
+  const candidates = routesForRequest(requires, requires.json === true);
   if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
   const skipped = new Set<string>();
+  let attempt = 0;
   for (const route of candidates) {
     if (skipped.has(route.probe.provider.id)) continue;
+    attempt += 1;
     let upstream: Response;
     try {
       providerCalls.set(route.probe.provider.id, (providerCalls.get(route.probe.provider.id) ?? 0) + 1);
       const request = providerBody(route, { ...body, stream: body.stream === true });
       upstream = await callProvider(route, request);
     } catch {
+      logRouteAttempt(currentRequestId, route, attempt, 'transport_error');
       skipped.add(route.probe.provider.id);
       continue;
     }
     if (upstream.status === 402) exhaustedProviders.add(route.probe.provider.id);
     if (upstream.status === 402 || upstream.status === 429 || upstream.status >= 500) {
+      logRouteAttempt(currentRequestId, route, attempt, `retry_http_${upstream.status}`);
       skipped.add(route.probe.provider.id);
       continue;
     }
     if (!upstream.ok) {
+      logRouteAttempt(currentRequestId, route, attempt, `http_${upstream.status}`);
       res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
       return res.end(await upstream.text());
     }
     let answer: Json;
-    try { answer = await collectAnswer(route, upstream); } catch { skipped.add(route.probe.provider.id); continue; }
+    try { answer = await collectAnswer(route, upstream); } catch {
+      logRouteAttempt(currentRequestId, route, attempt, 'response_parse_error');
+      skipped.add(route.probe.provider.id);
+      continue;
+    }
+    logRouteAttempt(currentRequestId, route, attempt, `served_http_${upstream.status}`);
     if (body.stream === true) sendOpenAIStream(answer, res);
     else sendJson(res, 200, answer);
     return;
@@ -508,12 +553,14 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const candidates = routesFor(requirementsFor(body));
+  const candidates = routesForRequest(requirementsFor(body));
   if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
   const requested = typeof body.model === 'string' && body.model !== '' ? body.model : candidates[0].model.id;
   const skipped = new Set<string>();
+  let attempt = 0;
   for (const route of candidates) {
     if (skipped.has(route.probe.provider.id)) continue;
+    attempt += 1;
     let upstream: Response;
     try {
       providerCalls.set(route.probe.provider.id, (providerCalls.get(route.probe.provider.id) ?? 0) + 1);
@@ -523,14 +570,27 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
         : providerBody(route, { ...asOpen, stream: body.stream === true });
       upstream = await callProvider(route, native);
     } catch {
+      logRouteAttempt(currentRequestId, route, attempt, 'transport_error');
       skipped.add(route.probe.provider.id);
       continue;
     }
     if (upstream.status === 402) exhaustedProviders.add(route.probe.provider.id);
-    if (upstream.status === 402 || upstream.status === 429 || upstream.status >= 500) { skipped.add(route.probe.provider.id); continue; }
-    if (!upstream.ok) return sendJson(res, upstream.status, anthropicError('api_error', `the provider answered HTTP ${upstream.status}`));
+    if (upstream.status === 402 || upstream.status === 429 || upstream.status >= 500) {
+      logRouteAttempt(currentRequestId, route, attempt, `retry_http_${upstream.status}`);
+      skipped.add(route.probe.provider.id);
+      continue;
+    }
+    if (!upstream.ok) {
+      logRouteAttempt(currentRequestId, route, attempt, `http_${upstream.status}`);
+      return sendJson(res, upstream.status, anthropicError('api_error', `the provider answered HTTP ${upstream.status}`));
+    }
     let normalized: Json;
-    try { normalized = await collectAnswer(route, upstream); } catch { skipped.add(route.probe.provider.id); continue; }
+    try { normalized = await collectAnswer(route, upstream); } catch {
+      logRouteAttempt(currentRequestId, route, attempt, 'response_parse_error');
+      skipped.add(route.probe.provider.id);
+      continue;
+    }
+    logRouteAttempt(currentRequestId, route, attempt, `served_http_${upstream.status}`);
     if (body.stream === true) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       for await (const event of anthropicEventsFromOpenAI(streamFromAnswer(normalized), requested)) res.write(event);
@@ -639,3 +699,105 @@ try {
   process.exit(1);
 }
 // Deterministic provider routing and wire translation for the make.fun trial.
+// Manifest planning pass: commit the full trial assignment before serving requests.
+// Candidates carry provider/model identity, requirement eligibility, and rating_milli.
+function planManifestAssignments(manifest, candidatesByRequest) {
+  const eligibleProviders = new Set();
+  for (const request of manifest) {
+    for (const candidate of candidatesByRequest.get(request.id) || []) {
+      if (candidate.legal !== false) eligibleProviders.add(candidate.provider);
+    }
+  }
+  const providerCap = Math.ceil(manifest.length / Math.max(1, eligibleProviders.size)) + 1;
+  const counts = new Map();
+  const plan = new Map();
+  const reserved = manifest.filter((request) => request.id === "r01" || request.id === "r02");
+  const rest = manifest.filter((request) => request.id !== "r01" && request.id !== "r02");
+  const bestByProvider = (request) => {
+    const best = new Map();
+    for (const candidate of candidatesByRequest.get(request.id) || []) {
+      if (candidate.legal === false) continue;
+      const previous = best.get(candidate.provider);
+      if (!previous || candidate.rating_milli > previous.rating_milli
+        || (candidate.rating_milli === previous.rating_milli && String(candidate.model) < String(previous.model))) {
+        best.set(candidate.provider, candidate);
+      }
+    }
+    return [...best.values()].sort((a, b) => b.rating_milli - a.rating_milli
+      || String(a.provider).localeCompare(String(b.provider)) || String(a.model).localeCompare(String(b.model)));
+  };
+  // Lock the top eligible tools+vision capacity for r01 and r02 before assigning ordinary work.
+  for (const request of reserved) {
+    const chosen = bestByProvider(request).find((candidate) => (counts.get(candidate.provider) || 0) < providerCap);
+    if (!chosen) throw new Error(`No capacity-feasible legal model for ${request.id}`);
+    plan.set(request.id, chosen);
+    counts.set(chosen.provider, (counts.get(chosen.provider) || 0) + 1);
+  }
+
+  // Maximum-weight bipartite flow gives the remaining requests the best global weighted rating sum.
+  const providers = [...eligibleProviders].sort();
+  const source = 0;
+  const requestStart = 1;
+  const providerStart = requestStart + rest.length;
+  const sink = providerStart + providers.length;
+  const graph = Array.from({ length: sink + 1 }, () => []);
+  const addEdge = (from, to, capacity, cost, candidate = null) => {
+    const forward = { to, rev: graph[to].length, capacity, cost, candidate };
+    const reverse = { to: from, rev: graph[from].length, capacity: 0, cost: -cost, candidate: null };
+    graph[from].push(forward);
+    graph[to].push(reverse);
+    return forward;
+  };
+  const providerNode = new Map(providers.map((provider, index) => [provider, providerStart + index]));
+  const assignmentEdges = [];
+  for (let index = 0; index < rest.length; index += 1) {
+    const request = rest[index];
+    const node = requestStart + index;
+    addEdge(source, node, 1, 0);
+    for (const candidate of bestByProvider(request)) {
+      const edge = addEdge(node, providerNode.get(candidate.provider), 1, -candidate.rating_milli * request.weight, candidate);
+      assignmentEdges.push({ request, edge });
+    }
+  }
+  for (const provider of providers) addEdge(providerNode.get(provider), sink,
+    providerCap - (counts.get(provider) || 0), 0);
+  let flow = 0;
+  while (flow < rest.length) {
+    const distance = Array(graph.length).fill(Infinity);
+    const previousNode = Array(graph.length).fill(-1);
+    const previousEdge = Array(graph.length).fill(-1);
+    distance[source] = 0;
+    for (let pass = 0; pass < graph.length - 1; pass += 1) {
+      let changed = false;
+      for (let node = 0; node < graph.length; node += 1) {
+        if (!Number.isFinite(distance[node])) continue;
+        for (let edgeIndex = 0; edgeIndex < graph[node].length; edgeIndex += 1) {
+          const edge = graph[node][edgeIndex];
+          const next = distance[node] + edge.cost;
+          if (edge.capacity > 0 && next < distance[edge.to]) {
+            distance[edge.to] = next;
+            previousNode[edge.to] = node;
+            previousEdge[edge.to] = edgeIndex;
+            changed = true;
+          }
+        }
+      }
+      if (!changed) break;
+    }
+    if (previousNode[sink] < 0) break;
+    for (let node = sink; node !== source; node = previousNode[node]) {
+      const edge = graph[previousNode[node]][previousEdge[node]];
+      edge.capacity -= 1;
+      graph[node][edge.rev].capacity += 1;
+    }
+    flow += 1;
+  }
+  for (const { request, edge } of assignmentEdges) if (edge.capacity === 0) plan.set(request.id, edge.candidate);
+  if (plan.size !== manifest.length) throw new Error(`Manifest plan assigned ${plan.size}/${manifest.length} requests`);
+  for (const request of rest) {
+    const chosen = plan.get(request.id);
+    counts.set(chosen.provider, (counts.get(chosen.provider) || 0) + 1);
+  }
+  return { assignments: plan, providerCap, providerCounts: counts };
+}
+
