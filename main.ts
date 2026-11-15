@@ -98,6 +98,51 @@ let currentRequestId = 'unlisted';
 const providerCalls = new Map<string, number>();
 const exhaustedProviders = new Set<string>();
 
+// Per-trial provider health informs fallback order without changing the manifest plan.
+const providerHealth = new Map(brief.directory.providers.map((provider) => [provider.id, {
+  consecutiveFailures: 0, totalCalls: 0, totalFailures: 0, coolUntil: 0,
+}]));
+let requestIndex = 0;
+
+function healthFor(providerId) {
+  let health = providerHealth.get(providerId);
+  if (!health) {
+    health = { consecutiveFailures: 0, totalCalls: 0, totalFailures: 0, coolUntil: 0 };
+    providerHealth.set(providerId, health);
+  }
+  return health;
+}
+
+function recordProviderOutcome(providerId, failed, succeeded = !failed) {
+  const health = healthFor(providerId);
+  health.totalCalls += 1;
+  if (failed) {
+    health.totalFailures += 1;
+    health.consecutiveFailures += 1;
+    if (health.consecutiveFailures >= 2) health.coolUntil = requestIndex + 2;
+  } else if (succeeded) {
+    health.consecutiveFailures = 0;
+    health.coolUntil = 0;
+  }
+}
+
+function healthPenalty(providerId, index) {
+  const health = healthFor(providerId);
+  if (health.coolUntil >= index && health.consecutiveFailures >= 2) return Infinity;
+  return health.consecutiveFailures === 1 ? 40 : 0;
+}
+
+function reorderFallbacks(candidates, index) {
+  const score = (candidate) => candidate.rating - Math.min(70, candidate.count * 15)
+    - healthPenalty(candidate.probe.provider.id, index);
+  return candidates.map((candidate, order) => ({ candidate, order }))
+    .filter(({ candidate }) => Number.isFinite(healthPenalty(candidate.probe.provider.id, index)))
+    .sort((a, b) => score(b.candidate) - score(a.candidate)
+      || healthFor(a.candidate.probe.provider.id).consecutiveFailures - healthFor(b.candidate.probe.provider.id).consecutiveFailures
+      || a.order - b.order)
+    .map(({ candidate }) => candidate);
+}
+
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
 }
@@ -123,7 +168,24 @@ async function load(): Promise<void> {
     candidates.set(request.id, options);
   }
   const planned = planManifestAssignments(manifest, candidates);
-  manifestPlan = new Map([...planned.assignments].map(([id, candidate]) => [id, candidate.route]));
+  const validated = new Map(planned.assignments);
+  for (const request of manifest) {
+    const assignment = validated.get(request.id);
+    const catalogProvider = catalog.providers.find((provider) => provider.id === assignment?.provider);
+    const presentFree = catalogProvider?.models.some((model) => model.id === assignment?.model && model.free === true) === true;
+    if (presentFree) continue;
+    const replacement = [...(candidates.get(request.id) ?? [])]
+      .filter((candidate) => catalog.providers.some((provider) => provider.id === candidate.provider
+        && provider.models.some((model) => model.id === candidate.model && model.free === true)))
+      .sort((a, b) => b.rating_milli - a.rating_milli || a.provider.localeCompare(b.provider) || a.model.localeCompare(b.model))[0];
+    if (replacement !== undefined) {
+      validated.set(request.id, replacement);
+      log(`plan replacement request=${request.id} from=${assignment?.provider ?? 'missing'}/${assignment?.model ?? 'missing'} to=${replacement.provider}/${replacement.model}`);
+    } else {
+      log(`plan validation found no catalog-free replacement for request=${request.id}`);
+    }
+  }
+  manifestPlan = new Map([...validated].map(([id, candidate]) => [id, candidate.route]));
   log(`planned ${manifestPlan.size} manifest requests with provider cap ${planned.providerCap}`);
 }
 
@@ -183,16 +245,19 @@ function routeFor(requires: Requirement, jsonOnly = false): Route | null {
 function routesForRequest(requires: Requirement, jsonOnly = false): Route[] {
   const candidates = routesFor(requires, jsonOnly);
   const assigned = manifestPlan.get(currentRequestId);
-  if (assigned === undefined) return candidates;
-  const index = candidates.findIndex((route) => route.probe.provider.id === assigned.probe.provider.id && route.model.id === assigned.model.id);
-  if (index <= 0) return candidates;
-  return [candidates[index], ...candidates.slice(0, index), ...candidates.slice(index + 1)];
+  const index = assigned === undefined ? -1 : candidates.findIndex((route) => route.probe.provider.id === assigned.probe.provider.id && route.model.id === assigned.model.id);
+  const planFirst = assigned === undefined || index < 0
+    ? candidates
+    : [candidates[index], ...candidates.slice(0, index), ...candidates.slice(index + 1)];
+  if (assigned === undefined || index < 0) return reorderFallbacks(planFirst, requestIndex);
+  return [planFirst[0], ...reorderFallbacks(planFirst.slice(1), requestIndex)];
 }
 
 /** Log only stable request/provider facts and the answer status, so replay output is deterministic. */
 function logRouteAttempt(requestId: string, route: Route, attempt: number, outcome: string): void {
   const rating = ratingOfModel(brief.ratings, route.probe.provider.id, route.model.id)?.rating_milli ?? 0;
-  log(`route request=${requestId} provider=${route.probe.provider.id} model=${route.model.id} rating_milli=${rating} attempt=${attempt} outcome=${outcome}`);
+  const failures = healthFor(route.probe.provider.id).consecutiveFailures;
+  log(`route request=${requestId} provider=${route.probe.provider.id} model=${route.model.id} rating_milli=${rating} consecutive_failures=${failures} attempt=${attempt} outcome=${outcome}`);
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -200,6 +265,7 @@ function requirementsFor(body: Json): Requirement {
   const manifest = brief.workload?.manifest ?? [];
   const entry = manifest[manifestIndex];
   manifestIndex += 1;
+  requestIndex = manifestIndex;
   if (entry !== undefined) {
     currentRequestId = entry.id;
     return entry.requires;
@@ -520,10 +586,13 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
       const request = providerBody(route, { ...body, stream: body.stream === true });
       upstream = await callProvider(route, request);
     } catch {
+      recordProviderOutcome(route.probe.provider.id, true);
       logRouteAttempt(currentRequestId, route, attempt, 'transport_error');
       skipped.add(route.probe.provider.id);
       continue;
     }
+    const failed = upstream.status === 402 || upstream.status === 429 || upstream.status >= 500;
+    recordProviderOutcome(route.probe.provider.id, failed, upstream.status >= 200 && upstream.status < 300);
     if (upstream.status === 402) exhaustedProviders.add(route.probe.provider.id);
     if (upstream.status === 402 || upstream.status === 429 || upstream.status >= 500) {
       logRouteAttempt(currentRequestId, route, attempt, `retry_http_${upstream.status}`);
@@ -570,10 +639,13 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
         : providerBody(route, { ...asOpen, stream: body.stream === true });
       upstream = await callProvider(route, native);
     } catch {
+      recordProviderOutcome(route.probe.provider.id, true);
       logRouteAttempt(currentRequestId, route, attempt, 'transport_error');
       skipped.add(route.probe.provider.id);
       continue;
     }
+    const failed = upstream.status === 402 || upstream.status === 429 || upstream.status >= 500;
+    recordProviderOutcome(route.probe.provider.id, failed, upstream.status >= 200 && upstream.status < 300);
     if (upstream.status === 402) exhaustedProviders.add(route.probe.provider.id);
     if (upstream.status === 402 || upstream.status === 429 || upstream.status >= 500) {
       logRouteAttempt(currentRequestId, route, attempt, `retry_http_${upstream.status}`);
@@ -800,4 +872,3 @@ function planManifestAssignments(manifest, candidatesByRequest) {
   }
   return { assignments: plan, providerCap, providerCounts: counts };
 }
-
