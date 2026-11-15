@@ -97,6 +97,7 @@ let manifestIndex = 0;
 let currentRequestId = 'unlisted';
 const providerCalls = new Map<string, number>();
 const exhaustedProviders = new Set<string>();
+const retiredProviders = new Set<string>();
 
 // Per-trial provider health informs fallback order without changing the manifest plan.
 const providerHealth = new Map(brief.directory.providers.map((provider) => [provider.id, {
@@ -119,7 +120,7 @@ function recordProviderOutcome(providerId, failed, succeeded = !failed) {
   if (failed) {
     health.totalFailures += 1;
     health.consecutiveFailures += 1;
-    if (health.consecutiveFailures >= 2) health.coolUntil = requestIndex + 2;
+    if (health.consecutiveFailures >= 2) retiredProviders.add(providerId);
   } else if (succeeded) {
     health.consecutiveFailures = 0;
     health.coolUntil = 0;
@@ -186,7 +187,7 @@ async function load(): Promise<void> {
     }
   }
   manifestPlan = new Map([...validated].map(([id, candidate]) => [id, candidate.route]));
-  log(`planned ${manifestPlan.size} manifest requests with provider cap ${planned.providerCap}`);
+  log(`planned ${manifestPlan.size} manifest requests with provider caps ${JSON.stringify(planned.providerCaps)}`);
 }
 
 const byId = (a: ProbedModel, b: ProbedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -221,6 +222,7 @@ function routesFor(requires: Requirement, jsonOnly = false): Route[] {
   for (const probe of probes) {
     if (!probe.ok) continue;
     if (exhaustedProviders.has(probe.provider.id)) continue;
+    if (retiredProviders.has(probe.provider.id)) continue;
     if (jsonOnly && probe.provider.wire !== 'openai') continue;
     for (const model of [...probe.models].sort(byId)) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
@@ -428,6 +430,10 @@ function providerBody(route: Route, body: Json): Json {
   const withModel = { ...body, model: route.model.id };
   if (route.probe.provider.wire === 'anthropic') return asAnthropic(withModel);
   if (route.probe.provider.wire === 'gemini') return asGemini(withModel);
+  if (withModel.stream === true) {
+    // Without include_usage the provider stream has no usage chunk, so the trial's usage check voids a valid reply.
+    return { ...withModel, stream_options: { ...withModel.stream_options, include_usage: true } };
+  }
   return withModel;
 }
 
@@ -780,7 +786,9 @@ function planManifestAssignments(manifest, candidatesByRequest) {
       if (candidate.legal !== false) eligibleProviders.add(candidate.provider);
     }
   }
-  const providerCap = Math.ceil(manifest.length / Math.max(1, eligibleProviders.size)) + 1;
+  const providerCaps = { groq: 3, cerebras: 2, gemini: 2, zai: 1, openrouter: 3,
+    sambanova: 1, pollinations: 3, cloudflare: 2, ovh: 2, kilol: 3 };
+  const capFor = (provider) => providerCaps[provider] ?? 2;
   const counts = new Map();
   const plan = new Map();
   const reserved = manifest.filter((request) => request.id === "r01" || request.id === "r02");
@@ -800,7 +808,7 @@ function planManifestAssignments(manifest, candidatesByRequest) {
   };
   // Lock the top eligible tools+vision capacity for r01 and r02 before assigning ordinary work.
   for (const request of reserved) {
-    const chosen = bestByProvider(request).find((candidate) => (counts.get(candidate.provider) || 0) < providerCap);
+    const chosen = bestByProvider(request).find((candidate) => (counts.get(candidate.provider) || 0) < capFor(candidate.provider));
     if (!chosen) throw new Error(`No capacity-feasible legal model for ${request.id}`);
     plan.set(request.id, chosen);
     counts.set(chosen.provider, (counts.get(chosen.provider) || 0) + 1);
@@ -832,7 +840,7 @@ function planManifestAssignments(manifest, candidatesByRequest) {
     }
   }
   for (const provider of providers) addEdge(providerNode.get(provider), sink,
-    providerCap - (counts.get(provider) || 0), 0);
+    capFor(provider) - (counts.get(provider) || 0), 0);
   let flow = 0;
   while (flow < rest.length) {
     const distance = Array(graph.length).fill(Infinity);
@@ -870,5 +878,5 @@ function planManifestAssignments(manifest, candidatesByRequest) {
     const chosen = plan.get(request.id);
     counts.set(chosen.provider, (counts.get(chosen.provider) || 0) + 1);
   }
-  return { assignments: plan, providerCap, providerCounts: counts };
+  return { assignments: plan, providerCaps, providerCounts: counts };
 }
